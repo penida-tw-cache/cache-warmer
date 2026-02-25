@@ -90,22 +90,53 @@ class AppsScriptLogger {
     }
     if (this.rows.length === 0) return;
 
-    try {
-      const res = await axios.post(
-        APPS_SCRIPT_URL,
-        { sheetName: this.sheetName, rows: this.rows },
-        { timeout: 20000, headers: { "Content-Type": "application/json" } }
-      );
-      console.log("Apps Script response:", res.status, res.data);
-      if (!res.data?.ok) console.warn("Apps Script replied error:", res.data);
-      this.rows = []; // bersihkan buffer
-    } catch (e) {
-      console.warn(
-        "Apps Script logging error:",
-        e?.response?.status,
-        e?.response?.data || e?.message || e
-      );
+    const CHUNK_SIZE = 50;
+    const MAX_RETRIES = 3;
+    const TIMEOUT = 60000; // 60 detik per chunk
+
+    const chunks = [];
+    for (let i = 0; i < this.rows.length; i += CHUNK_SIZE) {
+      chunks.push(this.rows.slice(i, i + CHUNK_SIZE));
     }
+
+    console.log(
+      `Apps Script: flushing ${this.rows.length} rows in ${chunks.length} chunk(s)...`
+    );
+
+    for (let ci = 0; ci < chunks.length; ci++) {
+      const chunk = chunks[ci];
+      let success = false;
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          const res = await axios.post(
+            APPS_SCRIPT_URL,
+            { sheetName: this.sheetName, rows: chunk },
+            { timeout: TIMEOUT, headers: { "Content-Type": "application/json" } }
+          );
+          console.log(
+            `Apps Script chunk ${ci + 1}/${chunks.length}: ${res.status}`,
+            res.data
+          );
+          if (!res.data?.ok)
+            console.warn("Apps Script replied error:", res.data);
+          success = true;
+          break;
+        } catch (e) {
+          console.warn(
+            `Apps Script chunk ${ci + 1}/${chunks.length} attempt ${attempt}/${MAX_RETRIES} failed:`,
+            e?.response?.status,
+            e?.response?.data || e?.message || e
+          );
+          if (attempt < MAX_RETRIES) await sleep(3000);
+        }
+      }
+      if (!success) {
+        console.warn(
+          `⚠️ Apps Script chunk ${ci + 1} failed after ${MAX_RETRIES} retries — ${chunk.length} rows lost`
+        );
+      }
+    }
+    this.rows = []; // bersihkan buffer
   }
 }
 
