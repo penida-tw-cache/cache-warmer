@@ -10,7 +10,7 @@ const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL; // URL Web App GAS /exec
 
 /* ====== KONFIG DOMAIN/PROXY/UA ====== */
 const DOMAINS_MAP = {
-  tw: "https://penidadivecenter.tw",
+  tw: "https://divingpenida.tw",
 };
 
 const PROXIES = {
@@ -18,7 +18,7 @@ const PROXIES = {
 };
 
 const USER_AGENTS = {
-  tw: "PenidaDiveCenter-TW-CacheWarmer/1.0",
+  tw: "DivingPenida-TW-CacheWarmer/1.0",
 };
 
 /* ====== CLOUDFLARE (opsional) ====== */
