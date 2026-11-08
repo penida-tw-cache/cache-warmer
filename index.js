@@ -56,7 +56,7 @@ class AppsScriptLogger {
     url = "",
     status = "",
     cfCache = "",
-    lsCache = "",
+    originCache = "",
     cfRay = "",
     responseMs = "",
     error = 0,
@@ -70,7 +70,7 @@ class AppsScriptLogger {
       url, // url
       status, // status code
       cfCache, // cf_cache
-      lsCache, // vercel_cache (dipakai utk LiteSpeed)
+      originCache, // vercel_cache
       cfRay, // cf_ray
       typeof responseMs === "number" ? responseMs : "", // response_ms
       error ? 1 : 0, // error (0/1)
@@ -152,6 +152,16 @@ function buildAxiosCfg(country, extra = {}) {
   return cfg;
 }
 
+function buildRevalidationAxiosCfg(country) {
+  const cfg = buildAxiosCfg(country, { timeout: 15000 });
+  cfg.headers = {
+    ...cfg.headers,
+    "Cache-Control": "no-cache",
+    Pragma: "no-cache",
+  };
+  return cfg;
+}
+
 /* ====== SITEMAP ====== */
 async function fetchWithProxy(url, country, timeout = 15000) {
   const cfg = buildAxiosCfg(country, { timeout });
@@ -161,25 +171,40 @@ async function fetchWithProxy(url, country, timeout = 15000) {
 
 async function fetchIndexSitemaps(domain, country) {
   try {
-    // WordPress Yoast umumnya: /sitemap_index.xml
-    const xml = await fetchWithProxy(
-      `${domain}/sitemap_index.xml`,
-      country,
-      15000
-    );
+    const xml = await fetchWithProxy(`${domain}/sitemap.xml`, country);
     const result = await parseStringPromise(xml, {
       explicitArray: false,
       ignoreAttrs: true,
     });
     const sitemapList = result?.sitemapindex?.sitemap;
-    if (!sitemapList) return [];
-    const sitemaps = Array.isArray(sitemapList) ? sitemapList : [sitemapList];
-    return sitemaps.map((entry) => entry.loc).filter(Boolean);
+    if (sitemapList) {
+      return {
+        sitemaps: (Array.isArray(sitemapList) ? sitemapList : [sitemapList])
+          .map((e) => e.loc)
+          .filter(Boolean),
+        urls: [],
+      };
+    }
+
+    // Some sites redirect /sitemap.xml to a sitemap containing URLs
+    // directly instead of a sitemap index containing child sitemap files.
+    const urlList = result?.urlset?.url;
+    if (urlList) {
+      return {
+        sitemaps: [],
+        urls: (Array.isArray(urlList) ? urlList : [urlList])
+          .map((e) => e.loc)
+          .filter(Boolean),
+      };
+    }
+
+    console.warn(`[${country}] Sitemap response has no <sitemapindex> or <urlset>`);
+    return { sitemaps: [], urls: [] };
   } catch (err) {
     console.warn(
-      `[${country}] ❌ Failed to fetch sitemap index: ${err?.message || err}`
+      `[${country}] Failed to fetch sitemap index: ${err?.message || err}`
     );
-    return [];
+    return { sitemaps: [], urls: [] };
   }
 }
 
@@ -263,37 +288,80 @@ async function warmUrls(urls, country, logger, batchSize = 1, delay = 2000) {
       batch.map(async (url) => {
         const t0 = Date.now();
         try {
-          const res = await retryableGet(
+          let res = await retryableGet(
             url,
             buildAxiosCfg(country, { timeout: 15000 }),
             3
           );
+          let originCache = res.headers["x-vercel-cache"] || "N/A";
+
+          if (String(originCache).toLowerCase() === "stale") {
+            console.log(
+              `[${country}] Vercel cache is STALE; purging Cloudflare and requesting synchronous revalidation: ${url}`
+            );
+            await purgeCloudflareCache(url);
+
+            try {
+              res = await retryableGet(
+                url,
+                buildRevalidationAxiosCfg(country),
+                1
+              );
+              originCache = res.headers["x-vercel-cache"] || "N/A";
+
+              if (String(originCache).toLowerCase() === "stale") {
+                console.warn(
+                  `[${country}] Vercel still returned STALE after synchronous revalidation: ${url}`
+                );
+              }
+            } catch (revalidationError) {
+              console.warn(
+                `[${country}] Vercel synchronous revalidation failed for ${url}: ${revalidationError?.message || revalidationError}`
+              );
+            }
+          }
+
           const dt = Date.now() - t0;
 
           const cfCache = res.headers["cf-cache-status"] || "N/A";
-          const lsCache = res.headers["x-litespeed-cache"] || "N/A";
           const cfRay = res.headers["cf-ray"] || "N/A";
           const cfEdge = cfRay.includes("-") ? cfRay.split("-")[1] : "N/A";
 
+          if (
+            String(originCache).toLowerCase() === "stale" &&
+            String(cfCache).toLowerCase() === "hit"
+          ) {
+            console.warn(
+              `[${country}] Cloudflare still served a cached STALE response; Vercel revalidation was not confirmed for ${url}`
+            );
+          }
+
           console.log(
-            `[${country}] ${res.status} cf=${cfCache} ls=${lsCache} edge=${cfEdge} - ${url}`
+            `[${country}] ${res.status} cf=${cfCache} vercel=${originCache} edge=${cfEdge} - ${url}`
           );
 
-          // Kumpulkan log (TIDAK dikirim sekarang; dikirim sekali di akhir run)
           logger.log({
             country: cfEdge,
             url,
             status: res.status,
             cfCache,
-            lsCache, // disimpan di kolom 'vercel_cache' (header lama)
+            originCache,
             cfRay,
             responseMs: dt,
             error: 0,
             message: "",
           });
 
-          // Aturan purge: kalau LiteSpeed bukan HIT → purge CF
-          if (String(lsCache).toLowerCase() !== "hit") {
+          const originCacheStatus = String(originCache).toLowerCase();
+          if (originCacheStatus === "stale") {
+            console.log(
+              `[${country}] Vercel is still STALE; purging Cloudflare again so this stale response is not left cached: ${url}`
+            );
+            await purgeCloudflareCache(url);
+          } else if (
+            originCache !== "N/A" &&
+            !["hit", "prerender", "revalidated"].includes(originCacheStatus)
+          ) {
             await purgeCloudflareCache(url);
           }
         } catch (err) {
@@ -313,7 +381,6 @@ async function warmUrls(urls, country, logger, batchSize = 1, delay = 2000) {
       })
     );
 
-    // TIDAK flush di sini → supaya semua baris terkirim SEKALI di akhir ke satu tab
     await sleep(delay);
   }
 }
@@ -328,13 +395,14 @@ async function warmUrls(urls, country, logger, batchSize = 1, delay = 2000) {
     for (const [country, domain] of Object.entries(DOMAINS_MAP)) {
       console.log(`\n========== [${country.toUpperCase()}] MULAI ==========`);
 
-      const sitemapList = await fetchIndexSitemaps(domain, country);
+      const { sitemaps: sitemapList, urls: directUrls } =
+        await fetchIndexSitemaps(domain, country);
       const urlArrays = await Promise.all(
         sitemapList.map((sitemapUrl) =>
           fetchUrlsFromSitemap(sitemapUrl, country)
         )
       );
-      const urls = urlArrays.flat().filter(Boolean);
+      const urls = [...directUrls, ...urlArrays.flat()].filter(Boolean);
 
       console.log(`[${country}] Found ${urls.length} URLs`);
       logger.log({
